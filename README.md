@@ -1,10 +1,10 @@
 # easy_ls
 
-Deserializes easyls rbxmx into a DOM using below rules, and dumps it into /src.
-- Any instance is treated as a directory by default
-- Instances of class "Script" or "ModuleScript" have source ciphertext extracted from "c" attribute, and wrote to */InstanceName.txt
-- If "c" attribute doesnt exist, the file is assumed to not depend on the runtime loader, and is skipped.
+`src/` contains all luau files required by plugin to boot.
+Plugin script calls `Bootstrap.luau`, which uses `Manifest.luau` and `Codec.luau` to build the appropriate plugin version.
 
-On plugin run, each encrypted file will use bootstrap to traverse the DOM and resolve its ciphertext.
+All of those versions can be found under `versions/`
 
-Path collisions are unhandled.
+To add a new version, compile the plugin file to JSON DOM using the codec, put it in versions and name it correctly.  It should be a json file.
+Then index it to `src/Manifest.luau`.
+Push to to main, and then users should all get update.
