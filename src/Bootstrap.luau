@@ -49,7 +49,7 @@ function bootstrap.build(coreScript,pluginInstance)
         )
     end)
     if not ok then
-        print(`Could not get bootstrap code at {manifestURL}`)
+        print(`Could not get manifest code at {manifestURL}`)
         error(manifest)
     end
     manifest = loadstring(manifest.Body)()
