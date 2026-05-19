@@ -2,6 +2,7 @@ local bootstrap = {}
 
 local HttpService = game:GetService("HttpService")
 
+local base = "http://raw.githubusercontent.com/%s/%s/%s/%s"
 local owner = "mcarey02005"
 local repo = "easy_ls"
 local branch = "main"
@@ -9,14 +10,14 @@ local manifestPath = "src/Manifest.luau"
 local codecPath = "src/Codec.luau"
 
 local manifestURL = HttpService:UrlEncode(string.format(
-	"https://raw.githubusercontent.com/%s/%s/%s/%s",
+	base,
 	owner,
 	repo,
 	branch,
 	manifestPath
 ))
 local codecURL = HttpService:UrlEncode(string.format(
-	"https://raw.githubusercontent.com/%s/%s/%s/%s",
+	base,
 	owner,
 	repo,
 	branch,
@@ -76,7 +77,7 @@ function bootstrap.build(coreScript,pluginInstance)
     end
 
     local domURL = HttpService:UrlEncode(string.format(
-        "https://raw.githubusercontent.com/%s/%s/%s/%s",
+        base,
         owner,
         repo,
         branch,
