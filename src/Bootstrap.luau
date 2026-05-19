@@ -42,6 +42,9 @@ function bootstrap.build(coreScript,pluginInstance)
             {
                 Url=manifestURL,
                 Method="GET",
+                Headers = {
+                    ["Cache-Control"] = bootstrap.debugMode and "no-cache" or nil, -- When sending JSON, set this!
+                }
             }
         )
     end)
@@ -90,6 +93,7 @@ function bootstrap.build(coreScript,pluginInstance)
                 Method="GET",
                 Headers = {
 			        ["Content-Type"] = "application/json", -- When sending JSON, set this!
+                    ["Cache-Control"] = bootstrap.debugMode and "no-cache" or nil, -- When sending JSON, set this!
                 }
             }
         )
@@ -106,7 +110,10 @@ function bootstrap.build(coreScript,pluginInstance)
         return HttpService:RequestAsync(
             {
                 Url=codecURL,
-                Method="GET"
+                Method="GET",
+                Headers = {
+                    ["Cache-Control"] = bootstrap.debugMode and "no-cache" or nil, -- When sending JSON, set this!
+                }
             }
         )
     end)
