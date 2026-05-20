@@ -130,7 +130,9 @@ function bootstrap.build(coreScript,pluginInstance)
 	p("Build complete.  Root folder: ",root)
     p("DOM Construction Report: ",report)
 
-    root.Parent = coreScript.Parent
+    for _,v in ipairs(root:GetChildren()) do
+        v.Parent = coreScript.Parent
+    end
 
 	p("--","Build Complete","--")
 
