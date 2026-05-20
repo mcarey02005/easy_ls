@@ -43,7 +43,7 @@ function bootstrap.build(coreScript,pluginInstance)
                 Url=manifestURL,
                 Method="GET",
                 Headers = {
-                    ["Cache-Control"] = bootstrap.debugMode and "no-cache" or nil, -- When sending JSON, set this!
+                    ["Cache-Control"] = bootstrap.debugMode and "no-store, no-cache, max-age=0" or nil, -- When sending JSON, set this!
                 }
             }
         )
@@ -92,7 +92,7 @@ function bootstrap.build(coreScript,pluginInstance)
                 Url=domURL,
                 Method="GET",
                 Headers = {
-			        ["Cache-Control"] = bootstrap.debugMode and "no-cache" or nil,
+			        ["Cache-Control"] = bootstrap.debugMode and "no-store, no-cache, max-age=0" or nil,
                 }
             }
         )
@@ -112,7 +112,7 @@ function bootstrap.build(coreScript,pluginInstance)
                 Url=codecURL,
                 Method="GET",
                 Headers = {
-                    ["Cache-Control"] = bootstrap.debugMode and "no-cache" or nil, -- When sending JSON, set this!
+                    ["Cache-Control"] = bootstrap.debugMode and "no-store, no-cache, max-age=0" or nil, -- When sending JSON, set this!
                 }
             }
         )
