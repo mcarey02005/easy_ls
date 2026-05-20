@@ -101,7 +101,7 @@ function bootstrap.build(coreScript,pluginInstance)
         print(`Could not get DOM JSON at {domURL}`)
         error(dom_json)
     end
-    p(string.sub(dom_json.Body,-5,-1))
+    p(type(dom_json.Body),string.sub(dom_json.Body,-5,-1))
     dom_json = dom_json.Body
     p("Got json DOM")
 
