@@ -139,7 +139,7 @@ function bootstrap.build(coreScript,pluginInstance)
 	--//run plugin
 
 	p("Requiring entry point function @ srcFolder/Core")
-	local runFunction = require(root.PluginCode.Core)
+	local runFunction = require(coreScript.Parent.PluginCode.Core)
 
 	p("Got entry point function","Running EasyLS")
 
