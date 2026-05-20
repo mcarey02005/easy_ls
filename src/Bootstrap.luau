@@ -48,7 +48,7 @@ function bootstrap.build(coreScript,pluginInstance)
             }
         )
     end)
-    if not ok then
+    if not (ok and manifest.Success)then
         print(`Could not get manifest code at {manifestURL}`)
         error(manifest)
     end
@@ -97,7 +97,7 @@ function bootstrap.build(coreScript,pluginInstance)
             }
         )
     end)
-    if not ok then
+    if not (ok and dom_json.Success) then
         print(`Could not get DOM JSON at {domURL}`)
         error(dom_json)
     end
@@ -117,7 +117,7 @@ function bootstrap.build(coreScript,pluginInstance)
             }
         )
     end)
-    if not ok then
+    if not (ok and codec.Success) then
         print(`Could not get codec code at {codecURL}`)
         error(codec)
     end
