@@ -92,8 +92,7 @@ function bootstrap.build(coreScript,pluginInstance)
                 Url=domURL,
                 Method="GET",
                 Headers = {
-			        ["Content-Type"] = "application/json", -- When sending JSON, set this!
-                    ["Cache-Control"] = bootstrap.debugMode and "no-cache" or nil, -- When sending JSON, set this!
+			        ["Cache-Control"] = bootstrap.debugMode and "no-cache" or nil,
                 }
             }
         )
@@ -102,6 +101,7 @@ function bootstrap.build(coreScript,pluginInstance)
         print(`Could not get DOM JSON at {domURL}`)
         error(dom_json)
     end
+    p(dom_json)
     dom_json = dom_json.Body
     p("Got json DOM")
 
