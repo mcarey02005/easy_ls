@@ -3,26 +3,26 @@ local bootstrap = {}
 local HttpService = game:GetService("HttpService")
 
 local base = "http://raw.githubusercontent.com/%s/%s/%s/%s"
-local owner = "mcarey02005"
-local repo = "easy_ls"
-local branch = "main"
-local manifestPath = "src/Manifest.luau"
-local codecPath = "src/Codec.luau"
+local owner = HttpService:UrlEncode("mcarey02005")
+local repo = HttpService:UrlEncode("easy_ls")
+local branch = HttpService:UrlEncode("main")
+local manifestPath = HttpService:UrlEncode("src/Manifest.luau")
+local codecPath = HttpService:UrlEncode("src/Codec.luau")
 
-local manifestURL = HttpService:UrlEncode(string.format(
+local manifestURL = string.format(
 	base,
 	owner,
 	repo,
 	branch,
 	manifestPath
-))
-local codecURL = HttpService:UrlEncode(string.format(
+)
+local codecURL = string.format(
 	base,
 	owner,
 	repo,
 	branch,
 	codecPath
-))
+)
 
 local function p(...)
     if not bootstrap.debugMode then return end
@@ -79,13 +79,13 @@ function bootstrap.build(coreScript,pluginInstance)
         error("No loadable versiondata found for this branch.  Check manifest and branch settings.")
     end
 
-    local domURL = HttpService:UrlEncode(string.format(
+    local domURL = string.format(
         base,
         owner,
         repo,
         branch,
-        versionData.package
-    ))
+        HttpService:UrlEncode(versionData.package)
+    )
     local ok,dom_json = pcall(function()
         return HttpService:RequestAsync(
             {
