@@ -44,6 +44,11 @@
 		local clone, decodeReport = Codec.Decode(dom, options?)
 		local clone, decodeReport = Codec.DecodeFromJSON(json, options?)
 
+	Decode scheduling:
+		Decode / DecodeFromJSON yield cooperatively during instance construction and
+		property application by default after about 0.2 seconds of work. Pass
+		{ DecodeYieldAfterSeconds = false } to disable, or set a number to tune it.
+
 	Recommended plugin usage:
 		local Selection = game:GetService("Selection")
 		local selected = Selection:Get()[1]
@@ -127,6 +132,7 @@ local function makeReport(mode)
 		attributesWritten = 0,
 		tagsRead = 0,
 		tagsWritten = 0,
+		schedulerYields = 0,
 		skipped = {},
 		failedReads = {},
 		failedWrites = {},
@@ -138,6 +144,52 @@ end
 
 local function push(list, item)
 	list[#list + 1] = item
+end
+
+local DEFAULT_DECODE_YIELD_AFTER_SECONDS = 0.2
+local DEFAULT_DECODE_YIELD_CHECK_INTERVAL = 64
+
+local function makeDecodeYieldState(options, report)
+	if options.DecodeYieldAfterSeconds == false then
+		return nil
+	end
+
+	if task == nil or type(task.wait) ~= "function" then
+		push(report.warnings, "Decode yielding is unavailable because task.wait is unavailable.")
+		return nil
+	end
+
+	return {
+		wait = task.wait,
+		yieldAfterSeconds = options.DecodeYieldAfterSeconds,
+		checkInterval = options.DecodeYieldCheckInterval,
+		checkCount = 0,
+		lastYieldTime = os.clock(),
+	}
+end
+
+local function maybeYield(ctx, forceCheck)
+	local state = ctx and ctx.decodeYieldState
+	if state == nil then
+		return
+	end
+
+	if not forceCheck then
+		state.checkCount += 1
+		if state.checkCount < state.checkInterval then
+			return
+		end
+		state.checkCount = 0
+	end
+
+	local now = os.clock()
+	if now - state.lastYieldTime < state.yieldAfterSeconds then
+		return
+	end
+
+	state.wait()
+	state.lastYieldTime = os.clock()
+	ctx.report.schedulerYields += 1
 end
 
 local function safeToString(value)
@@ -162,6 +214,22 @@ end
 
 local function mergeOptions(options)
 	options = options or {}
+
+	local decodeYieldAfterSeconds = options.DecodeYieldAfterSeconds
+	if decodeYieldAfterSeconds == nil then
+		decodeYieldAfterSeconds = options.YieldAfterSeconds
+	end
+	if decodeYieldAfterSeconds == nil then
+		decodeYieldAfterSeconds = DEFAULT_DECODE_YIELD_AFTER_SECONDS
+	end
+	if type(decodeYieldAfterSeconds) ~= "number" or decodeYieldAfterSeconds <= 0 then
+		decodeYieldAfterSeconds = false
+	end
+
+	local decodeYieldCheckInterval = options.DecodeYieldCheckInterval or DEFAULT_DECODE_YIELD_CHECK_INTERVAL
+	if type(decodeYieldCheckInterval) ~= "number" or decodeYieldCheckInterval < 1 then
+		decodeYieldCheckInterval = DEFAULT_DECODE_YIELD_CHECK_INTERVAL
+	end
 
 	local merged = {
 		-- Try to ask ReflectionService for the broadest reflected API surface.
@@ -222,6 +290,11 @@ local function mergeOptions(options)
 		-- Optional class gates for decode.
 		AllowedClasses = options.AllowedClasses,
 		DeniedClasses = options.DeniedClasses or {},
+
+		-- Cooperative decode scheduling. DecodeFromJSON cannot yield inside
+		-- HttpService:JSONDecode, but the instance/property build can yield.
+		DecodeYieldAfterSeconds = decodeYieldAfterSeconds,
+		DecodeYieldCheckInterval = decodeYieldCheckInterval,
 	}
 
 	return merged
@@ -530,7 +603,7 @@ local function base64Encode(data)
 	return table.concat(out)
 end
 
-local function base64Decode(data)
+local function base64Decode(data, ctx)
 	local clean = string.gsub(data, "%s", "")
 	if #clean % 4 ~= 0 then
 		error("invalid base64 length")
@@ -540,6 +613,10 @@ local function base64Decode(data)
 	local outIndex = 0
 
 	for i = 1, #clean, 4 do
+		if i % 8192 == 1 then
+			maybeYield(ctx, true)
+		end
+
 		local ch1 = string.sub(clean, i, i)
 		local ch2 = string.sub(clean, i + 1, i + 1)
 		local ch3 = string.sub(clean, i + 2, i + 2)
@@ -705,13 +782,17 @@ local function bufferToString(buf)
 	return table.concat(out)
 end
 
-local function stringToBuffer(str)
+local function stringToBuffer(str, ctx)
 	if buffer == nil then
 		error("buffer library is unavailable")
 	end
 
 	local buf = buffer.create(#str)
 	for i = 1, #str do
+		if i % 8192 == 1 then
+			maybeYield(ctx, true)
+		end
+
 		buffer.writeu8(buf, i - 1, string.byte(str, i))
 	end
 	return buf
@@ -1061,7 +1142,7 @@ encodeValue = function(value, ctx, hint, seenTables)
 	}
 end
 
-valueContainsInstanceReference = function(encoded)
+valueContainsInstanceReference = function(encoded, ctx)
 	if type(encoded) ~= "table" then
 		return false
 	end
@@ -1071,12 +1152,13 @@ valueContainsInstanceReference = function(encoded)
 	end
 
 	if encoded.type == "Content" and encoded.object ~= nil then
-		return valueContainsInstanceReference(encoded.object)
+		return valueContainsInstanceReference(encoded.object, ctx)
 	end
 
 	if encoded.type == "table" then
 		for _, entry in ipairs(encoded.entries or {}) do
-			if valueContainsInstanceReference(entry.key) or valueContainsInstanceReference(entry.value) then
+			maybeYield(ctx)
+			if valueContainsInstanceReference(entry.key, ctx) or valueContainsInstanceReference(entry.value, ctx) then
 				return true
 			end
 		end
@@ -1113,7 +1195,7 @@ decodeValue = function(encoded, ctx)
 
 	if encodedType == "string" then
 		if encoded.encoding == "base64" then
-			return base64Decode(encoded.value or "")
+			return base64Decode(encoded.value or "", ctx)
 		end
 		return encoded.value or ""
 	end
@@ -1177,6 +1259,7 @@ decodeValue = function(encoded, ctx)
 	if encodedType == "NumberSequence" then
 		local keypoints = {}
 		for _, encodedKp in ipairs(encoded.keypoints or {}) do
+			maybeYield(ctx)
 			push(keypoints, decodeValue(encodedKp, ctx))
 		end
 		return NumberSequence.new(keypoints)
@@ -1189,6 +1272,7 @@ decodeValue = function(encoded, ctx)
 	if encodedType == "ColorSequence" then
 		local keypoints = {}
 		for _, encodedKp in ipairs(encoded.keypoints or {}) do
+			maybeYield(ctx)
 			push(keypoints, decodeValue(encodedKp, ctx))
 		end
 		return ColorSequence.new(keypoints)
@@ -1306,12 +1390,13 @@ decodeValue = function(encoded, ctx)
 	end
 
 	if encodedType == "buffer" then
-		return stringToBuffer(base64Decode(encoded.value or ""))
+		return stringToBuffer(base64Decode(encoded.value or "", ctx), ctx)
 	end
 
 	if encodedType == "table" then
 		local result = {}
 		for _, entry in ipairs(encoded.entries or {}) do
+			maybeYield(ctx)
 			local key = decodeValue(entry.key, ctx)
 			local value = decodeValue(entry.value, ctx)
 			if key ~= nil then
@@ -1729,6 +1814,8 @@ local function createInstanceForNode(node, ctx)
 end
 
 local function createTreePass(node, ctx)
+	maybeYield(ctx)
+
 	local instance, isExisting = createInstanceForNode(node, ctx)
 	ctx.report.instances += 1
 
@@ -1745,6 +1832,7 @@ local function createTreePass(node, ctx)
 	push(ctx.records, record)
 
 	for _, childNode in ipairs(node.children or {}) do
+		maybeYield(ctx)
 		local childRecord = createTreePass(childNode, ctx)
 		push(record.children, childRecord)
 	end
@@ -1778,6 +1866,7 @@ local function reapplyConcreteGuiTransparencyProperties(record, ctx)
 	-- way to keep text visible is to apply the real concrete transparency fields
 	-- one final time after every other reflected property has been attempted.
 	for _, propertyName in ipairs(GUI_CONCRETE_TRANSPARENCY_PROPERTIES) do
+		maybeYield(ctx)
 		local encodedValue = props[propertyName]
 		if encodedValue ~= nil then
 			local ok, methodOrErr = writeProperty(instance, propertyName, encodedValue, ctx)
@@ -1791,11 +1880,15 @@ local function reapplyConcreteGuiTransparencyProperties(record, ctx)
 end
 
 local function applyPropertiesPass(record, ctx)
+	maybeYield(ctx)
+
 	local instance = record.instance
 	local node = record.node
 	local propertyNames = sortNamesForDecode(node.properties or {})
 
 	for _, propertyName in ipairs(propertyNames) do
+		maybeYield(ctx)
+
 		local encodedValue = node.properties[propertyName]
 		local skipAlias, aliasSkipReason = shouldSkipGuiObjectTransparencyAlias(instance, propertyName, node, ctx)
 
@@ -1813,7 +1906,7 @@ local function applyPropertiesPass(record, ctx)
 				property = propertyName,
 				reason = aliasSkipReason,
 			})
-		elseif valueContainsInstanceReference(encodedValue) then
+		elseif valueContainsInstanceReference(encodedValue, ctx) then
 			push(ctx.pendingReferenceProperties, {
 				record = record,
 				property = propertyName,
@@ -1841,6 +1934,8 @@ local function applyPropertiesPass(record, ctx)
 	reapplyConcreteGuiTransparencyProperties(record, ctx)
 
 	for attrName, encodedAttr in pairs(node.attributes or {}) do
+		maybeYield(ctx)
+
 		local okDecode, valueOrErr = pcall(function()
 			return decodeValue(encodedAttr, ctx)
 		end)
@@ -1871,6 +1966,8 @@ local function applyPropertiesPass(record, ctx)
 	end
 
 	for _, tag in ipairs(node.tags or {}) do
+		maybeYield(ctx)
+
 		if type(tag) == "string" then
 			if addTagSafe(instance, tag) then
 				ctx.report.tagsWritten += 1
@@ -1886,12 +1983,15 @@ local function applyPropertiesPass(record, ctx)
 	end
 
 	for _, childRecord in ipairs(record.children) do
+		maybeYield(ctx)
 		applyPropertiesPass(childRecord, ctx)
 	end
 end
 
-local function parentTreeInternally(record)
+local function parentTreeInternally(record, ctx)
 	for _, childRecord in ipairs(record.children) do
+		maybeYield(ctx)
+
 		local ok, err = pcall(function()
 			childRecord.instance.Parent = record.instance
 		end)
@@ -1899,12 +1999,14 @@ local function parentTreeInternally(record)
 			-- Parent failures are handled by caller's report through a wrapper.
 			error(errorToString(err))
 		end
-		parentTreeInternally(childRecord)
+		parentTreeInternally(childRecord, ctx)
 	end
 end
 
 local function applyPendingReferenceProperties(ctx)
 	for _, pending in ipairs(ctx.pendingReferenceProperties) do
+		maybeYield(ctx)
+
 		local record = pending.record
 		local ok, methodOrErr = writeProperty(record.instance, pending.property, pending.value, ctx)
 
@@ -1935,6 +2037,7 @@ function Codec.Decode(dom, options)
 	local ctx = {
 		options = mergedOptions,
 		report = report,
+		decodeYieldState = makeDecodeYieldState(mergedOptions, report),
 		idToInstance = {},
 		records = {},
 		pendingReferenceProperties = {},
@@ -1944,7 +2047,7 @@ function Codec.Decode(dom, options)
 	applyPropertiesPass(rootRecord, ctx)
 
 	local okParentInternal, parentErr = pcall(function()
-		parentTreeInternally(rootRecord)
+		parentTreeInternally(rootRecord, ctx)
 	end)
 	if not okParentInternal then
 		push(report.failedWrites, {
@@ -1984,6 +2087,9 @@ end
 function Codec.DecodeFromJSON(json, options)
 	assert(type(json) == "string", "Codec.DecodeFromJSON(json): json must be a string")
 
+	local mergedOptions = mergeOptions(options)
+	local decodeStartTime = os.clock()
+
 	local ok, domOrErr = pcall(function()
 		return HttpService:JSONDecode(json)
 	end)
@@ -1992,7 +2098,14 @@ function Codec.DecodeFromJSON(json, options)
 		error("HttpService:JSONDecode failed: " .. errorToString(domOrErr))
 	end
 
-	return Codec.Decode(domOrErr, options)
+	if mergedOptions.DecodeYieldAfterSeconds ~= false
+		and task ~= nil
+		and type(task.wait) == "function"
+		and os.clock() - decodeStartTime >= mergedOptions.DecodeYieldAfterSeconds then
+		task.wait()
+	end
+
+	return Codec.Decode(domOrErr, mergedOptions)
 end
 
 return Codec
