@@ -3,6 +3,7 @@ local api = {}
 
 api = {
 	versionManifest = { --/versions listed newest to oldest.  if released=true, public can access.
+		{version="v0.9.901",package="versions/0.9.901.json",released=false},
 		{version="v0.9.900",package="versions/0.9.900.json",released=false},
 	},	
 }
