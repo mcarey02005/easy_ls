@@ -51,6 +51,17 @@ def validate_transfer_id(value: Any) -> str:
     return value
 
 
+def clean_up_transfer_directory(transfer_directory: Path) -> None:
+    shutil.rmtree(transfer_directory, ignore_errors=True)
+
+    with transfer_lock:
+        try:
+            TEMP_DIRECTORY.rmdir()
+        except OSError:
+            # The directory is either not empty or already removed.
+            pass
+
+
 class ReceiverHandler(BaseHTTPRequestHandler):
     server_version = "RawChunkReceiver/1.0"
 
@@ -75,7 +86,9 @@ class ReceiverHandler(BaseHTTPRequestHandler):
 
     def read_body(self, maximum_size: int) -> bytes:
         try:
-            content_length = int(self.headers.get("Content-Length", "0"))
+            content_length = int(
+                self.headers.get("Content-Length", "0")
+            )
         except ValueError as error:
             raise ValueError("Invalid Content-Length") from error
 
@@ -111,15 +124,21 @@ class ReceiverHandler(BaseHTTPRequestHandler):
     def handle_start(self) -> None:
         request = self.read_json_body()
 
-        transfer_id = validate_transfer_id(request.get("transferId"))
+        transfer_id = validate_transfer_id(
+            request.get("transferId")
+        )
         total_chunks = request.get("totalChunks")
         total_bytes = request.get("totalBytes")
 
         if not isinstance(total_chunks, int) or total_chunks < 1:
-            raise ValueError("totalChunks must be a positive integer")
+            raise ValueError(
+                "totalChunks must be a positive integer"
+            )
 
         if not isinstance(total_bytes, int) or total_bytes < 1:
-            raise ValueError("totalBytes must be a positive integer")
+            raise ValueError(
+                "totalBytes must be a positive integer"
+            )
 
         transfer_directory = TEMP_DIRECTORY / transfer_id
 
@@ -160,12 +179,16 @@ class ReceiverHandler(BaseHTTPRequestHandler):
         if not index_values:
             raise ValueError("Missing chunkIndex")
 
-        transfer_id = validate_transfer_id(transfer_values[0])
+        transfer_id = validate_transfer_id(
+            transfer_values[0]
+        )
 
         try:
             chunk_index = int(index_values[0])
         except ValueError as error:
-            raise ValueError("chunkIndex must be an integer") from error
+            raise ValueError(
+                "chunkIndex must be an integer"
+            ) from error
 
         with transfer_lock:
             transfer = transfers.get(transfer_id)
@@ -176,13 +199,19 @@ class ReceiverHandler(BaseHTTPRequestHandler):
         total_chunks = transfer["total_chunks"]
 
         if chunk_index < 1 or chunk_index > total_chunks:
-            raise ValueError("chunkIndex is outside the expected range")
+            raise ValueError(
+                "chunkIndex is outside the expected range"
+            )
 
         chunk = self.read_body(MAX_CHUNK_BODY_SIZE)
 
         transfer_directory = TEMP_DIRECTORY / transfer_id
-        chunk_path = transfer_directory / f"{chunk_index:08d}.part"
-        temporary_path = transfer_directory / f"{chunk_index:08d}.tmp"
+        chunk_path = (
+            transfer_directory / f"{chunk_index:08d}.part"
+        )
+        temporary_path = (
+            transfer_directory / f"{chunk_index:08d}.tmp"
+        )
 
         temporary_path.write_bytes(chunk)
         temporary_path.replace(chunk_path)
@@ -203,7 +232,9 @@ class ReceiverHandler(BaseHTTPRequestHandler):
 
     def handle_complete(self) -> None:
         request = self.read_json_body()
-        transfer_id = validate_transfer_id(request.get("transferId"))
+        transfer_id = validate_transfer_id(
+            request.get("transferId")
+        )
 
         with transfer_lock:
             transfer = transfers.get(transfer_id)
@@ -235,7 +266,8 @@ class ReceiverHandler(BaseHTTPRequestHandler):
         with temporary_output.open("wb") as output:
             for index in range(1, total_chunks + 1):
                 chunk_path = (
-                    transfer_directory / f"{index:08d}.part"
+                    transfer_directory
+                    / f"{index:08d}.part"
                 )
 
                 with chunk_path.open("rb") as chunk_file:
@@ -256,14 +288,16 @@ class ReceiverHandler(BaseHTTPRequestHandler):
                 f"received {actual_bytes}"
             )
 
-        # Verify that the reconstructed file is valid JSON.
         try:
             with temporary_output.open(
                 "r",
                 encoding="utf-8",
             ) as completed_file:
                 json.load(completed_file)
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+        ) as error:
             temporary_output.unlink(missing_ok=True)
             raise ValueError(
                 "Reconstructed payload is not valid UTF-8 JSON"
@@ -274,7 +308,7 @@ class ReceiverHandler(BaseHTTPRequestHandler):
         with transfer_lock:
             transfers.pop(transfer_id, None)
 
-        shutil.rmtree(transfer_directory, ignore_errors=True)
+        clean_up_transfer_directory(transfer_directory)
 
         sha256 = digest.hexdigest()
 
@@ -292,7 +326,11 @@ class ReceiverHandler(BaseHTTPRequestHandler):
             },
         )
 
-    def log_message(self, format_string: str, *args: object) -> None:
+    def log_message(
+        self,
+        format_string: str,
+        *args: object,
+    ) -> None:
         print(
             f"{self.client_address[0]}: "
             f"{format_string % args}"
@@ -302,10 +340,15 @@ class ReceiverHandler(BaseHTTPRequestHandler):
 def main() -> None:
     TEMP_DIRECTORY.mkdir(parents=True, exist_ok=True)
 
-    server = ThreadingHTTPServer((HOST, PORT), ReceiverHandler)
+    server = ThreadingHTTPServer(
+        (HOST, PORT),
+        ReceiverHandler,
+    )
 
     print(f"Listening on http://{HOST}:{PORT}")
-    print(f"Completed JSON will be written to {OUTPUT_FILE}")
+    print(
+        f"Completed JSON will be written to {OUTPUT_FILE}"
+    )
 
     try:
         server.serve_forever()
@@ -313,6 +356,13 @@ def main() -> None:
         print("\nStopping receiver.")
     finally:
         server.server_close()
+
+        with transfer_lock:
+            if not transfers:
+                shutil.rmtree(
+                    TEMP_DIRECTORY,
+                    ignore_errors=True,
+                )
 
 
 if __name__ == "__main__":
