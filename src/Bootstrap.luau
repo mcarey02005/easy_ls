@@ -61,7 +61,7 @@ function bootstrap.build(coreScript,pluginInstance)
 	if string.match(script.Parent.Name,"Beta") then
 		isProd = false
 	end
-	p("Branch: "..isProd and "Production" or "Beta")
+	p("Branch: ".. (isProd and "Production" or "Beta"))
 
     --//Get plugin version and JSON
     p("Getting plugin version and JSON from manifest")
