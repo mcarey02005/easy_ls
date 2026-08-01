@@ -24,8 +24,7 @@ api.getLatestReleased = function()
 	local ver = api.versionManifest[i]
 
 	while ver and not ver.released do
-		i+=1
-		ver = next(api.versionManifest,i)
+		i,ver = next(api.versionManifest,i)
 	end
 
 	return ver
