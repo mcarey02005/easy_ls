@@ -71,7 +71,7 @@ function bootstrap.build(coreScript,pluginInstance)
     else
         versionData = manifest.getLatestBeta()
     end
-    p("Got manifest version data : ",versionData)
+    p("Got manifest version data : ",versionData or "None Found")
     p("Fetching DOM for version")
 
     if not (versionData and versionData.package) then
