@@ -1,4 +1,55 @@
 --!nonstrict
+--[[
+	Purpose:
+		Encode an Instance tree into a JSON-safe DOM table, then decode that DOM
+		back into an Instance tree.
+
+	Important truth:
+		Roblox does not allow every property to be read/written from every context.
+		This module attempts every reflected property it can see through ReflectionService,
+		but any security-protected, read-only, computed, non-creatable, unsupported, or
+		otherwise failing property is recorded in the returned report instead of being
+		silently ignored.
+
+	Script source:
+		For Script / LocalScript / ModuleScript, this module prefers ScriptEditorService
+		when available. That keeps long source strings intact and sees edit-time source
+		when running as a Studio plugin. Source strings are base64-encoded in the JSON DOM
+		by default so 10k+ character scripts do not get damaged by JSON escaping / UTF-8
+		edge cases.
+
+	DOM shape:
+		{
+			format = "RobloxInstanceJSONDOM",
+			version = 1,
+			root = {
+				id = "1",
+				class = "Folder",
+				properties = {
+					Name = { type = "string", value = "MyFolder" },
+				},
+				attributes = {},
+				tags = {},
+				children = {},
+				skipped = {},
+			},
+		}
+
+	Public API:
+		local Codec = require(path.To.InstanceDomCodec)
+
+		local dom, encodeReport = Codec.Encode(instance, options?)
+		local json, encodeReport = Codec.EncodeToJSON(instance, options?)
+
+		local clone, decodeReport = Codec.Decode(dom, options?)
+		local clone, decodeReport = Codec.DecodeFromJSON(json, options?)
+
+	Recommended plugin usage:
+		local Selection = game:GetService("Selection")
+		local selected = Selection:Get()[1]
+		local json, report = Codec.EncodeToJSON(selected)
+		print(json)
+]]
 
 local HttpService = game:GetService("HttpService")
 
@@ -7,8 +58,27 @@ Codec.Format = "RobloxInstanceJSONDOM"
 Codec.Version = 3
 
 -- Services are resolved lazily so this module can still load in older/stubbed contexts.
+local ReflectionService = nil
 local ScriptEditorService = nil
 local CollectionService = nil
+
+local function getReflectionService()
+	if ReflectionService ~= nil then
+		return ReflectionService
+	end
+
+	local ok, service = pcall(function()
+		return game:GetService("ReflectionService")
+	end)
+
+	if ok then
+		ReflectionService = service
+	else
+		ReflectionService = false
+	end
+
+	return ReflectionService ~= false and ReflectionService or nil
+end
 
 local function getScriptEditorService()
 	if ScriptEditorService ~= nil then
@@ -50,12 +120,18 @@ local function makeReport(mode)
 	return {
 		mode = mode,
 		instances = 0,
+		propertiesRead = 0,
 		propertiesWritten = 0,
 		propertiesReapplied = 0,
+		attributesRead = 0,
 		attributesWritten = 0,
+		tagsRead = 0,
 		tagsWritten = 0,
 		skipped = {},
+		failedReads = {},
 		failedWrites = {},
+		unsupportedValues = {},
+		externalReferences = {},
 		warnings = {},
 	}
 end
@@ -88,10 +164,28 @@ local function mergeOptions(options)
 	options = options or {}
 
 	local merged = {
+		-- Try to ask ReflectionService for the broadest reflected API surface.
+		-- Actual read/write still happens through pcall and can still fail.
+		UseAllSecurityCapabilities = options.UseAllSecurityCapabilities ~= false,
+
+		-- Include properties where ReflectionService says Serialized == false.
+		-- User asked for all properties, so default is true.
+		IncludeNonSerializedProperties = options.IncludeNonSerializedProperties ~= false,
+
+		-- Include attributes and tags in addition to properties.
+		IncludeAttributes = options.IncludeAttributes ~= false,
+		IncludeTags = options.IncludeTags ~= false,
+
 		-- For script source, prefer ScriptEditorService over direct .Source.
 		PreferScriptEditorSource = options.PreferScriptEditorSource ~= false,
+		IncludeScriptSource = options.IncludeScriptSource ~= false,
 
-		-- If false, properties that error are reported but decode continues.
+		-- Base64 large strings and script source so JSON cannot corrupt bytes.
+		EncodeScriptSourceAsBase64 = options.EncodeScriptSourceAsBase64 ~= false,
+		EncodeAllStringsAsBase64 = options.EncodeAllStringsAsBase64 == true,
+		EncodeLongStringsAsBase64Over = options.EncodeLongStringsAsBase64Over or 2048,
+
+		-- If false, properties that error are reported but encode/decode continues.
 		FailOnPropertyError = options.FailOnPropertyError == true,
 
 		-- Decode behavior for classes that cannot be Instance.new'd.
@@ -106,12 +200,24 @@ local function mergeOptions(options)
 		-- DOM that contains Transparency but not concrete transparency properties.
 		DecodeGuiObjectTransparencyAlias = options.DecodeGuiObjectTransparencyAlias == true,
 
+		-- Same alias problem on encode: keep this false by default so a freshly
+		-- encoded DOM cannot preserve the dangerous mixed alias and then corrupt
+		-- TextTransparency during decode in older/custom decoders. Set true only
+		-- if you explicitly need the hidden GuiObject.Transparency alias recorded.
+		EncodeGuiObjectTransparencyAlias = options.EncodeGuiObjectTransparencyAlias == true,
+
 		-- Where decoded root should be parented after the whole tree is built.
 		Parent = options.Parent,
 
 		-- Optional callback for external ObjectValue/Weld/etc refs outside encoded tree.
 		-- function(encodedExternalRef) -> Instance?
 		ResolveExternalInstanceRef = options.ResolveExternalInstanceRef,
+
+		-- Optional sets:
+		-- ExcludeProperties = { PropertyName = true }
+		-- IncludeProperties = { PropertyName = true } -- nil means include all attempted props
+		ExcludeProperties = options.ExcludeProperties or {},
+		IncludeProperties = options.IncludeProperties,
 
 		-- Optional class gates for decode.
 		AllowedClasses = options.AllowedClasses,
@@ -218,12 +324,145 @@ local function shouldSkipGuiObjectTransparencyAlias(instance, propertyName, node
 	return true, "skipped hidden GuiObject.Transparency mixed alias; concrete transparency properties are decoded instead"
 end
 
+local didTryAllCapabilities = false
+local cachedAllCapabilities = nil
+
+local function getAllSecurityCapabilities()
+	if didTryAllCapabilities then
+		return cachedAllCapabilities
+	end
+
+	didTryAllCapabilities = true
+
+	local ok, capabilities = pcall(function()
+		return SecurityCapabilities.new(table.unpack(Enum.SecurityCapability:GetEnumItems()))
+	end)
+
+	if ok then
+		cachedAllCapabilities = capabilities
+	end
+
+	return cachedAllCapabilities
+end
+
+local function describeReflectionType(reflectionType)
+	local luaType = typeof(reflectionType)
+
+	if luaType == "string" then
+		return reflectionType
+	end
+
+	if luaType == "EnumItem" then
+		return safeToString(reflectionType)
+	end
+
+	if luaType ~= "table" then
+		return safeToString(reflectionType)
+	end
+
+	local direct = reflectionType.Name
+		or reflectionType.Type
+		or reflectionType.Category
+		or reflectionType.ClassName
+		or reflectionType.ValueType
+
+	if direct ~= nil then
+		return safeToString(direct)
+	end
+
+	return "<reflection type table>"
+end
+
+local reflectedPropertyCache = {}
+
+local function getReflectedProperties(className, options, report)
+	local cacheKey = className .. "|" .. tostring(options.IncludeNonSerializedProperties) .. "|" .. tostring(options.UseAllSecurityCapabilities)
+	if reflectedPropertyCache[cacheKey] ~= nil then
+		return reflectedPropertyCache[cacheKey]
+	end
+
+	local reflection = getReflectionService()
+	if not reflection then
+		push(report.warnings, "ReflectionService is unavailable; only manually added properties can be encoded.")
+		reflectedPropertyCache[cacheKey] = {}
+		return reflectedPropertyCache[cacheKey]
+	end
+
+	local filter = {
+		ExcludeInherited = false,
+		ExcludeDisplay = true,
+	}
+
+	if options.UseAllSecurityCapabilities then
+		local capabilities = getAllSecurityCapabilities()
+		if capabilities ~= nil then
+			filter.Security = capabilities
+		end
+	end
+
+	local ok, reflected = pcall(function()
+		return reflection:GetPropertiesOfClass(className, filter)
+	end)
+
+	if not ok or type(reflected) ~= "table" then
+		push(report.warnings, "ReflectionService:GetPropertiesOfClass failed for " .. className .. ": " .. errorToString(reflected))
+		reflectedPropertyCache[cacheKey] = {}
+		return reflectedPropertyCache[cacheKey]
+	end
+
+	local byName = {}
+	for _, propertyInfo in ipairs(reflected) do
+		if type(propertyInfo) == "table" and type(propertyInfo.Name) == "string" then
+			if options.IncludeNonSerializedProperties or propertyInfo.Serialized == true then
+				byName[propertyInfo.Name] = propertyInfo
+			end
+		end
+	end
+
+	local result = {}
+	for _, propertyInfo in pairs(byName) do
+		push(result, propertyInfo)
+	end
+
+	table.sort(result, function(a, b)
+		return a.Name < b.Name
+	end)
+
+	reflectedPropertyCache[cacheKey] = result
+	return result
+end
+
 local function isLuaSourceContainer(instance)
 	local ok, result = pcall(function()
 		return instance:IsA("LuaSourceContainer")
 	end)
 
 	return ok and result == true
+end
+
+local function getScriptSource(instance, ctx)
+	if ctx.options.PreferScriptEditorSource then
+		local scriptEditor = getScriptEditorService()
+		if scriptEditor then
+			local ok, source = pcall(function()
+				return scriptEditor:GetEditorSource(instance)
+			end)
+
+			if ok and type(source) == "string" then
+				return true, source, "ScriptEditorService:GetEditorSource"
+			end
+		end
+	end
+
+	local ok, source = pcall(function()
+		return instance.Source
+	end)
+
+	if ok and type(source) == "string" then
+		return true, source, "Instance.Source"
+	end
+
+	return false, errorToString(source), nil
 end
 
 local function setScriptSource(instance, source, ctx)
@@ -259,6 +498,36 @@ local BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012
 local BASE64_LOOKUP = {}
 for i = 1, #BASE64_ALPHABET do
 	BASE64_LOOKUP[string.sub(BASE64_ALPHABET, i, i)] = i - 1
+end
+
+local function base64Encode(data)
+	local out = {}
+	local outIndex = 0
+	local length = #data
+
+	for i = 1, length, 3 do
+		local b1 = string.byte(data, i) or 0
+		local b2 = string.byte(data, i + 1) or 0
+		local b3 = string.byte(data, i + 2) or 0
+		local remaining = length - i + 1
+
+		local triple = b1 * 65536 + b2 * 256 + b3
+		local c1 = math.floor(triple / 262144) % 64
+		local c2 = math.floor(triple / 4096) % 64
+		local c3 = math.floor(triple / 64) % 64
+		local c4 = triple % 64
+
+		outIndex += 1
+		out[outIndex] = string.sub(BASE64_ALPHABET, c1 + 1, c1 + 1)
+		outIndex += 1
+		out[outIndex] = string.sub(BASE64_ALPHABET, c2 + 1, c2 + 1)
+		outIndex += 1
+		out[outIndex] = remaining >= 2 and string.sub(BASE64_ALPHABET, c3 + 1, c3 + 1) or "="
+		outIndex += 1
+		out[outIndex] = remaining >= 3 and string.sub(BASE64_ALPHABET, c4 + 1, c4 + 1) or "="
+	end
+
+	return table.concat(out)
 end
 
 local function base64Decode(data)
@@ -305,6 +574,59 @@ local function base64Decode(data)
 	return table.concat(out)
 end
 
+local function isValidUtf8(str)
+	if utf8 == nil or utf8.len == nil then
+		return true
+	end
+
+	local ok, lenOrErr = pcall(function()
+		return utf8.len(str)
+	end)
+
+	return ok and lenOrErr ~= nil
+end
+
+local function stringShouldUseBase64(str, hint, options)
+	if options.EncodeAllStringsAsBase64 then
+		return true
+	end
+
+	if hint and hint.propertyName == "Source" and options.EncodeScriptSourceAsBase64 then
+		return true
+	end
+
+	if options.EncodeLongStringsAsBase64Over and #str >= options.EncodeLongStringsAsBase64Over then
+		return true
+	end
+
+	if string.find(str, "%z") ~= nil then
+		return true
+	end
+
+	if not isValidUtf8(str) then
+		return true
+	end
+
+	local reflectedType = hint and hint.reflectedType or ""
+	if reflectedType == "BinaryString" or reflectedType == "SharedString" then
+		return true
+	end
+
+	return false
+end
+
+local function encodeEnumItem(enumItem)
+	local enumTypeText = safeToString(enumItem.EnumType)
+	local enumName = string.gsub(enumTypeText, "^Enum%.", "")
+
+	return {
+		type = "EnumItem",
+		enum = enumName,
+		name = enumItem.Name,
+		value = enumItem.Value,
+	}
+end
+
 local function decodeEnumItem(encoded)
 	local enumName = encoded.enum or encoded.enumType
 	local enumObject = Enum[enumName]
@@ -330,24 +652,57 @@ local function decodeEnumItem(encoded)
 	error("unknown enum item: " .. safeToString(enumName) .. "." .. safeToString(encoded.name))
 end
 
+local function packVector2(v)
+	return { x = v.X, y = v.Y }
+end
+
 local function unpackVector2(v)
 	return Vector2.new(v.x or v[1] or 0, v.y or v[2] or 0)
+end
+
+local function packVector3(v)
+	return { x = v.X, y = v.Y, z = v.Z }
 end
 
 local function unpackVector3(v)
 	return Vector3.new(v.x or v[1] or 0, v.y or v[2] or 0, v.z or v[3] or 0)
 end
 
+local function packColor3(c)
+	return { r = c.R, g = c.G, b = c.B }
+end
+
 local function unpackColor3(c)
 	return Color3.new(c.r or c[1] or 0, c.g or c[2] or 0, c.b or c[3] or 0)
+end
+
+local function packUDim(u)
+	return { scale = u.Scale, offset = u.Offset }
 end
 
 local function unpackUDim(u)
 	return UDim.new(u.scale or u[1] or 0, u.offset or u[2] or 0)
 end
 
+local function packCFrame(cf)
+	return { cf:GetComponents() }
+end
+
 local function unpackCFrame(components)
 	return CFrame.new(table.unpack(components))
+end
+
+local function bufferToString(buf)
+	if buffer == nil then
+		error("buffer library is unavailable")
+	end
+
+	local len = buffer.len(buf)
+	local out = {}
+	for i = 0, len - 1 do
+		out[#out + 1] = string.char(buffer.readu8(buf, i))
+	end
+	return table.concat(out)
 end
 
 local function stringToBuffer(str)
@@ -362,8 +717,350 @@ local function stringToBuffer(str)
 	return buf
 end
 
+local encodeValue = nil
 local decodeValue = nil
 local valueContainsInstanceReference = nil
+
+local function encodeTable(value, ctx, hint, seenTables)
+	seenTables = seenTables or {}
+	if seenTables[value] then
+		return {
+			type = "Unsupported",
+			valueType = "table",
+			reason = "cyclic table",
+		}
+	end
+
+	seenTables[value] = true
+
+	local entries = {}
+	for k, v in pairs(value) do
+		local encodedKey = encodeValue(k, ctx, nil, seenTables)
+		local encodedValue = encodeValue(v, ctx, nil, seenTables)
+		push(entries, {
+			key = encodedKey,
+			value = encodedValue,
+		})
+	end
+
+	seenTables[value] = nil
+
+	return {
+		type = "table",
+		entries = entries,
+	}
+end
+
+encodeValue = function(value, ctx, hint, seenTables)
+	local valueType = typeof(value)
+
+	if value == nil then
+		return { type = "nil" }
+	end
+
+	if valueType == "boolean" then
+		return { type = "boolean", value = value }
+	end
+
+	if valueType == "number" then
+		if value ~= value then
+			return { type = "number", special = "nan" }
+		elseif value == math.huge then
+			return { type = "number", special = "inf" }
+		elseif value == -math.huge then
+			return { type = "number", special = "-inf" }
+		end
+
+		return { type = "number", value = value }
+	end
+
+	if valueType == "string" then
+		if stringShouldUseBase64(value, hint, ctx.options) then
+			return {
+				type = "string",
+				encoding = "base64",
+				value = base64Encode(value),
+				length = #value,
+			}
+		end
+
+		return { type = "string", value = value }
+	end
+
+	if valueType == "Vector2" then
+		return { type = "Vector2", value = packVector2(value) }
+	end
+
+	if valueType == "Vector2int16" then
+		return { type = "Vector2int16", value = { x = value.X, y = value.Y } }
+	end
+
+	if valueType == "Vector3" then
+		return { type = "Vector3", value = packVector3(value) }
+	end
+
+	if valueType == "Vector3int16" then
+		return { type = "Vector3int16", value = { x = value.X, y = value.Y, z = value.Z } }
+	end
+
+	if valueType == "Color3" then
+		return { type = "Color3", value = packColor3(value) }
+	end
+
+	if valueType == "UDim" then
+		return { type = "UDim", value = packUDim(value) }
+	end
+
+	if valueType == "UDim2" then
+		return {
+			type = "UDim2",
+			value = {
+				x = packUDim(value.X),
+				y = packUDim(value.Y),
+			},
+		}
+	end
+
+	if valueType == "CFrame" then
+		return { type = "CFrame", value = packCFrame(value) }
+	end
+
+	if valueType == "EnumItem" then
+		return encodeEnumItem(value)
+	end
+
+	if valueType == "BrickColor" then
+		return {
+			type = "BrickColor",
+			name = safeToString(value),
+			number = value.Number,
+		}
+	end
+
+	if valueType == "NumberRange" then
+		return {
+			type = "NumberRange",
+			min = value.Min,
+			max = value.Max,
+		}
+	end
+
+	if valueType == "NumberSequenceKeypoint" then
+		return {
+			type = "NumberSequenceKeypoint",
+			time = value.Time,
+			value = value.Value,
+			envelope = value.Envelope,
+		}
+	end
+
+	if valueType == "NumberSequence" then
+		local keypoints = {}
+		for _, kp in ipairs(value.Keypoints) do
+			push(keypoints, encodeValue(kp, ctx))
+		end
+		return { type = "NumberSequence", keypoints = keypoints }
+	end
+
+	if valueType == "ColorSequenceKeypoint" then
+		return {
+			type = "ColorSequenceKeypoint",
+			time = value.Time,
+			color = packColor3(value.Value),
+		}
+	end
+
+	if valueType == "ColorSequence" then
+		local keypoints = {}
+		for _, kp in ipairs(value.Keypoints) do
+			push(keypoints, encodeValue(kp, ctx))
+		end
+		return { type = "ColorSequence", keypoints = keypoints }
+	end
+
+	if valueType == "Rect" then
+		return {
+			type = "Rect",
+			min = packVector2(value.Min),
+			max = packVector2(value.Max),
+		}
+	end
+
+	if valueType == "Ray" then
+		return {
+			type = "Ray",
+			origin = packVector3(value.Origin),
+			direction = packVector3(value.Direction),
+		}
+	end
+
+	if valueType == "Region3" then
+		local cf = value.CFrame
+		local size = value.Size
+		local half = size / 2
+		return {
+			type = "Region3",
+			min = packVector3(cf.Position - half),
+			max = packVector3(cf.Position + half),
+		}
+	end
+
+	if valueType == "Region3int16" then
+		return {
+			type = "Region3int16",
+			min = { x = value.Min.X, y = value.Min.Y, z = value.Min.Z },
+			max = { x = value.Max.X, y = value.Max.Y, z = value.Max.Z },
+		}
+	end
+
+	if valueType == "Faces" then
+		return {
+			type = "Faces",
+			Top = value.Top,
+			Bottom = value.Bottom,
+			Left = value.Left,
+			Right = value.Right,
+			Front = value.Front,
+			Back = value.Back,
+		}
+	end
+
+	if valueType == "Axes" then
+		return {
+			type = "Axes",
+			X = value.X,
+			Y = value.Y,
+			Z = value.Z,
+		}
+	end
+
+	if valueType == "PhysicalProperties" then
+		return {
+			type = "PhysicalProperties",
+			density = value.Density,
+			friction = value.Friction,
+			elasticity = value.Elasticity,
+			frictionWeight = value.FrictionWeight,
+			elasticityWeight = value.ElasticityWeight,
+		}
+	end
+
+	if valueType == "Font" then
+		return {
+			type = "Font",
+			family = value.Family,
+			weight = encodeValue(value.Weight, ctx),
+			style = encodeValue(value.Style, ctx),
+		}
+	end
+
+	if valueType == "Content" then
+		local sourceType = value.SourceType
+		local sourceTypeName = sourceType and sourceType.Name or nil
+
+		if sourceTypeName == "Uri" then
+			return {
+				type = "Content",
+				sourceType = "Uri",
+				uri = value.Uri,
+			}
+		elseif sourceTypeName == "Object" then
+			return {
+				type = "Content",
+				sourceType = "Object",
+				object = encodeValue(value.Object, ctx),
+			}
+		elseif sourceTypeName == "None" then
+			return {
+				type = "Content",
+				sourceType = "None",
+			}
+		else
+			return {
+				type = "Unsupported",
+				valueType = "Content",
+				reason = "Content source type is not supported: " .. safeToString(sourceTypeName),
+			}
+		end
+	end
+
+	if valueType == "DateTime" then
+		return {
+			type = "DateTime",
+			unixTimestampMillis = value.UnixTimestampMillis,
+		}
+	end
+
+	if valueType == "TweenInfo" then
+		return {
+			type = "TweenInfo",
+			time = value.Time,
+			easingStyle = encodeValue(value.EasingStyle, ctx),
+			easingDirection = encodeValue(value.EasingDirection, ctx),
+			repeatCount = value.RepeatCount,
+			reverses = value.Reverses,
+			delayTime = value.DelayTime,
+		}
+	end
+
+	if valueType == "PathWaypoint" then
+		return {
+			type = "PathWaypoint",
+			position = packVector3(value.Position),
+			action = encodeValue(value.Action, ctx),
+			label = value.Label,
+		}
+	end
+
+	if valueType == "Instance" then
+		local id = ctx.instanceToId and ctx.instanceToId[value]
+		if id ~= nil then
+			return {
+				type = "InstanceRef",
+				ref = id,
+			}
+		end
+
+		local external = {
+			type = "ExternalInstanceRef",
+			class = value.ClassName,
+			name = value.Name,
+			path = value:GetFullName(),
+		}
+		push(ctx.report.externalReferences, external)
+		return external
+	end
+
+	if valueType == "buffer" then
+		local raw = bufferToString(value)
+		return {
+			type = "buffer",
+			encoding = "base64",
+			value = base64Encode(raw),
+			length = #raw,
+		}
+	end
+
+	if valueType == "table" then
+		return encodeTable(value, ctx, hint, seenTables)
+	end
+
+	if valueType == "Secret" then
+		return {
+			type = "Unsupported",
+			valueType = "Secret",
+			reason = "Secret values are intentionally not serialized",
+		}
+	end
+
+	return {
+		type = "Unsupported",
+		valueType = valueType,
+		string = safeToString(value),
+		reason = "No serializer registered for typeof(value)",
+	}
+end
+
 valueContainsInstanceReference = function(encoded)
 	if type(encoded) ~= "table" then
 		return false
@@ -631,6 +1328,72 @@ decodeValue = function(encoded, ctx)
 	error("unknown encoded value type: " .. safeToString(encodedType))
 end
 
+local function shouldAttemptProperty(propertyName, propertyInfo, instance, options)
+	if RESERVED_PROPERTIES[propertyName] then
+		return false, "reserved structural property"
+	end
+
+	if options.ExcludeProperties[propertyName] then
+		return false, "excluded by options.ExcludeProperties"
+	end
+
+	if options.IncludeProperties ~= nil and not options.IncludeProperties[propertyName] then
+		return false, "not present in options.IncludeProperties"
+	end
+
+	if propertyName == "Source" and not options.IncludeScriptSource then
+		return false, "script source disabled by options.IncludeScriptSource"
+	end
+
+	if propertyName == "Transparency" and isA(instance, "GuiObject") and not options.EncodeGuiObjectTransparencyAlias then
+		return false, "skipped hidden GuiObject.Transparency mixed alias; concrete transparency properties are encoded instead"
+	end
+
+	return true, nil
+end
+
+local function addManualPropertiesIfNeeded(instance, properties)
+	local seen = {}
+	for _, prop in ipairs(properties) do
+		seen[prop.Name] = true
+	end
+
+	-- Source can be security-filtered or absent depending on context. Since the user
+	-- specifically requested full scripts, force an attempt for LuaSourceContainer.
+	if isLuaSourceContainer(instance) and not seen.Source then
+		push(properties, {
+			Name = "Source",
+			Serialized = true,
+			Type = "ProtectedString",
+			Manual = true,
+		})
+	end
+
+	table.sort(properties, function(a, b)
+		return a.Name < b.Name
+	end)
+end
+
+local function readProperty(instance, propertyName, propertyInfo, ctx)
+	if propertyName == "Source" and isLuaSourceContainer(instance) then
+		local ok, sourceOrErr, method = getScriptSource(instance, ctx)
+		if ok then
+			return true, sourceOrErr, method
+		end
+		return false, sourceOrErr, method
+	end
+
+	local ok, value = pcall(function()
+		return instance[propertyName]
+	end)
+
+	if ok then
+		return true, value, nil
+	end
+
+	return false, errorToString(value), nil
+end
+
 local function writeProperty(instance, propertyName, encodedValue, ctx)
 	local decodedValue = nil
 	local okDecode, decodeErr = pcall(function()
@@ -668,6 +1431,28 @@ local function writeProperty(instance, propertyName, encodedValue, ctx)
 	return false, errorToString(writeErr)
 end
 
+local function getTagsSafe(instance)
+	local ok, tags = pcall(function()
+		return instance:GetTags()
+	end)
+
+	if ok and type(tags) == "table" then
+		return tags
+	end
+
+	local collection = getCollectionService()
+	if collection then
+		local ok2, tags2 = pcall(function()
+			return collection:GetTags(instance)
+		end)
+		if ok2 and type(tags2) == "table" then
+			return tags2
+		end
+	end
+
+	return {}
+end
+
 local function addTagSafe(instance, tag)
 	local ok = pcall(function()
 		instance:AddTag(tag)
@@ -686,6 +1471,209 @@ local function addTagSafe(instance, tag)
 	end
 
 	return false
+end
+
+local function assignIds(root, ctx)
+	ctx.nextId += 1
+	ctx.instanceToId[root] = tostring(ctx.nextId)
+
+	for _, child in ipairs(root:GetChildren()) do
+		assignIds(child, ctx)
+	end
+end
+
+local function encodeInstance(instance, ctx)
+	ctx.report.instances += 1
+
+	local id = ctx.instanceToId[instance]
+	local node = {
+		id = id,
+		class = instance.ClassName,
+		properties = {},
+		attributes = {},
+		tags = {},
+		children = {},
+		skipped = {},
+	}
+
+	local properties = getReflectedProperties(instance.ClassName, ctx.options, ctx.report)
+	local propertyCopy = {}
+	for _, prop in ipairs(properties) do
+		propertyCopy[#propertyCopy + 1] = prop
+	end
+	addManualPropertiesIfNeeded(instance, propertyCopy)
+
+	for _, propertyInfo in ipairs(propertyCopy) do
+		local propertyName = propertyInfo.Name
+		local shouldAttempt, skipReason = shouldAttemptProperty(propertyName, propertyInfo, instance, ctx.options)
+
+		if not shouldAttempt then
+			local item = {
+				id = id,
+				class = instance.ClassName,
+				property = propertyName,
+				reason = skipReason,
+			}
+			push(node.skipped, item)
+			push(ctx.report.skipped, item)
+		else
+			local okRead, valueOrErr, readMethod = readProperty(instance, propertyName, propertyInfo, ctx)
+			if not okRead then
+				local item = {
+					id = id,
+					class = instance.ClassName,
+					property = propertyName,
+					reason = valueOrErr,
+				}
+				push(node.skipped, item)
+				push(ctx.report.failedReads, item)
+
+				if ctx.options.FailOnPropertyError then
+					error("Failed to read " .. instance:GetFullName() .. "." .. propertyName .. ": " .. valueOrErr)
+				end
+			else
+				local reflectedType = describeReflectionType(propertyInfo.Type)
+				local hint = {
+					propertyName = propertyName,
+					reflectedType = reflectedType,
+				}
+
+				local okEncode, encodedOrErr = pcall(function()
+					return encodeValue(valueOrErr, ctx, hint)
+				end)
+
+				if not okEncode then
+					local item = {
+						id = id,
+						class = instance.ClassName,
+						property = propertyName,
+						reason = "encode failed: " .. errorToString(encodedOrErr),
+					}
+					push(node.skipped, item)
+					push(ctx.report.unsupportedValues, item)
+				elseif type(encodedOrErr) == "table" and encodedOrErr.type == "Unsupported" then
+					encodedOrErr.reflectedType = reflectedType
+					encodedOrErr.serialized = propertyInfo.Serialized == true
+					node.properties[propertyName] = encodedOrErr
+					push(ctx.report.unsupportedValues, {
+						id = id,
+						class = instance.ClassName,
+						property = propertyName,
+						valueType = encodedOrErr.valueType,
+						reason = encodedOrErr.reason,
+					})
+				else
+					encodedOrErr.reflectedType = reflectedType
+					encodedOrErr.serialized = propertyInfo.Serialized == true
+					if readMethod ~= nil then
+						encodedOrErr.readMethod = readMethod
+					end
+					node.properties[propertyName] = encodedOrErr
+					ctx.report.propertiesRead += 1
+				end
+			end
+		end
+	end
+
+	if ctx.options.IncludeAttributes then
+		local okAttrs, attrsOrErr = pcall(function()
+			return instance:GetAttributes()
+		end)
+
+		if okAttrs and type(attrsOrErr) == "table" then
+			for attrName, attrValue in pairs(attrsOrErr) do
+				local okEncode, encodedAttr = pcall(function()
+					return encodeValue(attrValue, ctx, { propertyName = "@" .. attrName })
+				end)
+
+				if okEncode then
+					node.attributes[attrName] = encodedAttr
+					ctx.report.attributesRead += 1
+				else
+					push(ctx.report.unsupportedValues, {
+						id = id,
+						class = instance.ClassName,
+						attribute = attrName,
+						reason = errorToString(encodedAttr),
+					})
+				end
+			end
+		else
+			push(ctx.report.failedReads, {
+				id = id,
+				class = instance.ClassName,
+				property = "<attributes>",
+				reason = errorToString(attrsOrErr),
+			})
+		end
+	end
+
+	if ctx.options.IncludeTags then
+		for _, tag in ipairs(getTagsSafe(instance)) do
+			if type(tag) == "string" then
+				push(node.tags, tag)
+				ctx.report.tagsRead += 1
+			end
+		end
+		table.sort(node.tags)
+	end
+
+	for _, child in ipairs(instance:GetChildren()) do
+		push(node.children, encodeInstance(child, ctx))
+	end
+
+	return node
+end
+
+function Codec.Encode(root, options)
+	assert(typeof(root) == "Instance", "Codec.Encode(root): root must be an Instance")
+
+	local mergedOptions = mergeOptions(options)
+	local report = makeReport("encode")
+	local ctx = {
+		options = mergedOptions,
+		report = report,
+		instanceToId = {},
+		nextId = 0,
+	}
+
+	assignIds(root, ctx)
+
+	local dom = {
+		format = Codec.Format,
+		version = Codec.Version,
+		generatedUnixTime = os.time(),
+		root = encodeInstance(root, ctx),
+	}
+
+	return dom, report
+end
+
+function Codec.EncodeToJSON(root, options)
+	local dom, report = Codec.Encode(root, options)
+
+	local ok, jsonOrErr = pcall(function()
+		return HttpService:JSONEncode(dom)
+	end)
+
+	if not ok then
+		error("HttpService:JSONEncode failed: " .. errorToString(jsonOrErr))
+	end
+
+	return jsonOrErr, report
+end
+
+function Codec.EncodeToJSON_File(root,options)
+	local dom,report = Codec.EncodeToJSON(root,options)
+	
+	local result = Instance.new("Script")
+	result.Enabled = false
+	result.Name = "JSON Result"
+	game:GetService("ScriptEditorService"):UpdateSourceAsync(result,function()
+		return dom
+	end)
+	
+	return result,report
 end
 
 local function createInstanceForNode(node, ctx)
