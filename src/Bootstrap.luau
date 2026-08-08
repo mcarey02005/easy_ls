@@ -147,7 +147,7 @@ function bootstrap.build(coreScript,pluginInstance)
 
 	runFunction(pluginInstance)
 
-	print("--","Load OK.  EasyLS ready.",`This is {versionData.version} on branch {branchString}`,"--")
+	print("--\n","Load OK.  EasyLS ready.\n",`This is {versionData.version} on branch {branchString}\n`,"--")
 end
 
 return bootstrap
