@@ -147,7 +147,7 @@ function bootstrap.build(coreScript,pluginInstance)
 
 	runFunction(pluginInstance)
 
-	p("--","Entry point executed.  Plugin ready.",`This is {versionData.version} in branch {branchString}`,"--")
+	print("--","Load OK.  EasyLS ready.",`This is {versionData.version} on branch {branchString}`,"--")
 end
 
 return bootstrap
