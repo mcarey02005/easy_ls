@@ -61,7 +61,9 @@ function bootstrap.build(coreScript,pluginInstance)
 	if string.match(script.Parent.Name,"Beta") then
 		isProd = false
 	end
-	p("Branch: ".. (isProd and "Production" or "Beta"))
+    local branchString = (isProd and "Production" or "Beta")
+
+	p("Branch: ".. branchString)
 
     --//Get plugin version and JSON
     p("Getting plugin version and JSON from manifest")
@@ -145,7 +147,7 @@ function bootstrap.build(coreScript,pluginInstance)
 
 	runFunction(pluginInstance)
 
-	p("Entry point executed.  Plugin ready.")
+	p("--","Entry point executed.  Plugin ready.",`This is {versionData.version} in branch {branchString}`,"--")
 end
 
 return bootstrap
