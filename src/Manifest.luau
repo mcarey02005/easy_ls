@@ -3,6 +3,7 @@ local api = {}
 
 api = {
 	versionManifest = { --/versions listed newest to oldest.  if released=true, public can access.
+		{version="v1.0.005",package="versions/1.0.005.json",released=false},
 		{version="v1.0.004",package="versions/1.0.004.json",released=true},
 		{version="v1.0.003",package="versions/1.0.003.json",released=false}, --compiler/luraph bug
 		{version="v1.0.002",package="versions/1.0.002.json",released=true},
